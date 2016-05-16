@@ -14,8 +14,11 @@ jobs:
 
     properties:
       dbolo:
-        submission: 127.0.0.1
+        submission:
+          address: 127.0.0.1
       bolo:
         rrd:
-          subscription: 127.0.0.1
-          submission:   127.0.0.1
+          subscription:
+            address: 127.0.0.1
+          submission:
+            address: 127.0.0.1
