@@ -1,7 +1,7 @@
 ---
 jobs:
   - name: bolo
-    instances: 0
+    instances: 1
     persistent_disk: 4096
     templates:
       - { release: bolo, name: bolo }
