@@ -1,0 +1,2456 @@
+#!/bin/bash
+VERSION=1.3.0
+
+USERNAME=$(whoami)
+CANON_REPO=https://github.com/starkandwayne/genesis
+
+####################################################
+# common functions used by other parts of Genesis
+
+find_toplevel_root() {
+	(while [[ $(pwd) != "/" && ! -d global/ && ! -f .deployment ]]; do
+		cd ..
+	 done
+	 if [[ -d global || -f .deployment ]]; then
+		pwd
+	 fi)
+}
+
+all_sites() {
+	setup
+	for dir in ${DEPLOYMENT_ROOT}/*/; do
+		site=${dir%%/}
+		site=${site##*/}
+
+		if [[ "${site}" != "global" && -d "${dir}/site" ]]; then
+			echo ${site}
+		fi
+	done
+}
+
+all_environments_for() {
+	local site=${1:?all_environments_for() - no site name provided}
+	setup
+	for dir in ${DEPLOYMENT_ROOT}/${site}/*/; do
+		env=${dir%%/}
+		env=${env##*/}
+
+		if [[ "${env}" != "site" && -f "${dir}/Makefile" ]]; then
+			echo ${env}
+		fi
+	done
+}
+
+setup() {
+	if [[ ${DEPLOYMENT_ROOT:-unset} != "unset" ]]; then
+		return
+	fi
+
+	DEPLOYMENT_ROOT=$(find_toplevel_root)
+	if [[ -z ${DEPLOYMENT_ROOT:-} ]]; then
+		echo >&2 "Unable to determine Genesis DEPLOYMENT_ROOT"
+		exit 3
+	fi
+
+	# What type of deployment is this?
+	#
+	#    normal    - A normal deployment
+	#    bosh      - A BOSH deployment (currently-favored type)
+	#    microbosh - MicroBOSH deployment
+	#    bosh-init - A bosh-init BOSH deployment
+	#
+	DEPLOYMENT_TYPE=normal
+	if [[ -f "${DEPLOYMENT_ROOT}/.deployment" ]]; then
+		DEPLOYMENT_TYPE=$(cat "${DEPLOYMENT_ROOT}/.deployment")
+	fi
+
+	case ${DEPLOYMENT_TYPE} in
+	(bosh) DEPLOYMENT_TYPE=bosh-init ;;
+	(normal|bosh-init|microbosh) ;;
+	(*) echo >&2 "Unrecognized deployment type: ${DEPLOYMENT_TYPE}"
+	    exit 3 ;;
+	esac
+
+	DEPLOYMENT_SITE=""
+	DEPLOYMENT_ENVIRONMENT=""
+
+	local relpath=${PWD##$DEPLOYMENT_ROOT/}
+	if [[ ${relpath#global} == ${relpath} ]]; then
+		# not in /global
+		local site=${relpath%%/*}
+		if [[ -n ${site} && -d "${DEPLOYMENT_ROOT}/${site}" && -d "${DEPLOYMENT_ROOT}/${site}/site" ]]; then
+			DEPLOYMENT_SITE=${site}
+
+			relpath=${relpath#$site/}
+			local env=${relpath%%/*}
+			if [[ -n ${env} && ${env} != "site" && -d "${DEPLOYMENT_ROOT}/${site}/${env}" ]]; then
+				DEPLOYMENT_ENVIRONMENT=${env}
+			fi
+		fi
+	fi
+
+	SPRUCE_OPTS=""
+	if [[ -n "${SPRUCE_TRACE}" ]]; then
+		SPRUCE_OPTS="--debug --trace"
+	elif [[ -n "${SPRUCE_DEBUG}" ]]; then
+		SPRUCE_OPTS="--debug"
+	fi
+
+	DEPLOYMENT_NAME="${DEPLOYMENT_ROOT##*/}"
+	DEPLOYMENT_NAME="${DEPLOYMENT_NAME%%-deployment*}"
+	DEPLOYMENT_SITE_DIR="${DEPLOYMENT_ROOT}/${DEPLOYMENT_SITE}"
+	DEPLOYMENT_ENV_DIR="${DEPLOYMENT_ROOT}/${DEPLOYMENT_SITE}/${DEPLOYMENT_ENVIRONMENT}"
+}
+
+ensure_yaml_files() {
+  for i in $*; do
+    [ -f $i ] && echo $i
+    shift
+  done
+}
+
+####################################################
+# checks and validating functions
+
+need_command() {
+	local cmd=${1:?need_command() - no command name given}
+
+	if [[ ! -x "$(command -v $cmd)" ]]; then
+		echo >&2 "${cmd} is not installed."
+		if [[ "${cmd}" == "spruce" ]]; then
+			echo >&2 "Please download it from https://github.com/geofffranks/spruce/releases"
+		fi
+		exit 2
+	fi
+}
+
+check_site_name() {
+	local site=${1:?check_site_name() - no site name provided}
+
+	cleaned=$(echo -n ${site} | sed -e 's/[^a-z0-9_-]//')
+	if [[ ${cleaned} != ${site} ]]; then
+		echo >&2 "Error: Site name '${site}' contains invalid characters"
+		exit 2
+	fi
+}
+
+check_environment_name() {
+	local env=${1:?check_environment_name() - no env name provided}
+
+	case ${env} in
+	(site|global)
+		echo >&2 "Error: Environment name '${env}' is reserved"
+		exit 2
+		;;
+	esac
+
+	cleaned=$(echo -n ${env} | sed -e 's/[^a-z0-9_-]//')
+	if [[ ${cleaned} != ${env} ]]; then
+		echo >&2 "Error: Environment name '${env}' contains invalid characters"
+		exit 2
+	fi
+}
+
+must_be_in_a_site() {
+	setup
+	if [[ -z ${DEPLOYMENT_SITE} ]]; then
+		echo >&2 "Error: Must be in a site directory to run this command"
+		exit 2
+	fi
+}
+
+must_be_in_an_environment() {
+	setup
+	if [[ -z ${DEPLOYMENT_ENVIRONMENT} ]]; then
+		echo >&2 "Error: must be in an environment directory to run this command"
+		exit 2
+	fi
+}
+
+####################################################
+# helper functions
+
+env_root() {
+	site=${1:?env_root() - No site given}
+	name=${2:?env_root() - No environment given}
+
+	setup
+	echo "${DEPLOYMENT_ROOT}/${site}/${name}"
+}
+
+switch_to() {
+	local site=${1}
+	local name=${2}
+
+	if [[ -z ${site} ]]; then
+		cd ${DEPLOYMENT_ROOT}/global
+	elif [[ -z ${name} ]]; then
+		cd ${DEPLOYMENT_ROOT}/${site}/site
+	else
+		cd ${DEPLOYMENT_ROOT}/${site}/${name}
+	fi
+
+	unset DEPLOYMENT_ROOT
+	setup
+}
+
+create_makefile() {
+	path=${1:?create_makefile() - No path given}
+
+	cat > ${path} <<EOF
+# genesis, available at ${CANON_REPO}
+
+save_VAULT_ADDR := \$(VAULT_ADDR)
+VAULT_ADDR =
+REDACT = yes
+
+root_path := \$(realpath \$(dir \$(abspath \$(lastword \$(MAKEFILE_LIST))))../..)
+ifdef USE_SYSTEM_GENESIS
+	PATH := \$(PATH)
+else
+	PATH := \$(root_path)/bin:\$(PATH)
+endif
+
+help: check
+	@PATH=\$(PATH) genesis help makefile
+
+version:
+	@PATH=\$(PATH) echo "using \$\$(which genesis)"
+	@PATH=\$(PATH) genesis version
+
+manifest: check
+	@PATH=\$(PATH) genesis build
+
+deploy: check
+	@VAULT_ADDR=\$(save_VAULT_ADDR) PATH=\$(PATH) REDACT= genesis deploy
+
+refresh: check
+	@PATH=\$(PATH) genesis refresh
+
+check:
+	@PATH=\$(PATH) genesis ping >/dev/null 2>&1 || (echo >&2 "You need to install Genesis first (see ${CANON_REPO})" && exit 1)
+
+.PHONY: help check manifest deploy refresh version
+EOF
+}
+
+create_root_readme() {
+	cat <<EOF
+${DEPLOYMENT_NAME} Deployments
+==============================
+
+This repository contains the YAML templates that make up a series of
+${DEPLOYMENT_NAME} BOSH deployments, using the format prescribed by the
+[Genesis][1] utility.
+
+The configuration is broken up into three logical strata: _global_,
+_site_, and _environment_.  _Global_ defines the universal aspects of any
+deployment, including overall job structure, constituent BOSH releases,
+and invariant (or default) properties.  Each _site_ represents a single
+IaaS (an AWS VPC, a vSphere cluster, etc.), and further refines the global
+configuration for that infrastructure.  Each _environment_ represents a
+single BOSH deployment, with specific network numbering, credentials,
+domain names, etc.
+
+For more information, see the READMEs scattered throughout this repository,
+and check out \`genesis help\`.  You can download the Genesis program from
+[Github][1]
+
+Quickstart
+----------
+
+To create a new site:
+
+    genesis new site NAME
+
+To create a new environment
+
+    cd site-name/
+    genesis new environment NAME
+
+To build the full BOSH manifest for an environment:
+
+    cd site-name/env-name
+    make manifest
+
+... and then deploy it:
+
+    cd site-name/env-name
+    make deploy
+
+
+
+
+[1]: ${CANON_REPO}
+EOF
+}
+
+create_global_readme() {
+	case ${DEPLOYMENT_TYPE} in
+	(normal) # {{{
+		cat <<EOF
+Global Definitions
+
+This directory contains templates that describe the common elements of this
+deployments, to be shared (and possibly overridden) by sites and environments.
+The templates are merged in the following order:
+
+  global/jobs.yml             Specify what jobs will make up the canonical
+                              deployment, and what templates to apply to them.
+
+  global/deployment.yml       Define the global structure of all deployments
+                              with the correct param calls to remind template
+                              writers to override the correct things.
+
+  global/properties.yml       Define the properties (global or per-job) for this
+                              deployment.
+
+
+NOTE: If you make changes to the templates in here, they will automatically
+propagate to any newly-created environments, but you will need to run a
+refresh for existing environments to receive those updates.
+EOF
+		;; # }}}
+	(microbosh) # {{{
+		cat <<EOF
+Global Definitions
+
+This directory contains templates that describe the common elements of MicroBOSH
+deployments, to be shared (and possibly overridden) by sites and environments.
+
+  global/deployment.yml       Define the global structure of all MicroBOSH
+                              deployments, with the correct param calls to remind
+                              template writers to override the correct things.
+
+
+NOTE: If you make changes to the templates in here, they will automatically
+propagate to any newly-created environments, but you will need to run a
+refresh for existing environments to receive those updates.
+EOF
+		;; # }}}
+	(bosh-init) # {{{
+		cat <<EOF
+Global Definitions
+
+This directory contains templates that describe the common elements of BOSH
+deployments, to be shared (and possibly overridden) by sites and environments.
+The templates are merged in the following order:
+
+  global/jobs.yml             Specify what jobs will make up the BOSH deployment,
+                              and what templates to apply to them.
+
+  global/deployment.yml       Define the global structure of all BOSH deployments
+                              with the correct param calls to remind template
+                              writers to override the correct things.
+
+  global/properties.yml       Define the properties (global or per-job) for the
+                              BOSH deployment.
+
+
+NOTE: If you make changes to the templates in here, they will automatically
+propagate to any newly-created environments, but you will need to run a
+refresh for existing environments to receive those updates.
+EOF
+		;; # }}}
+	esac
+}
+
+create_site_readme() {
+	local site=${1:?create_site_readme() - no site given}
+
+	case ${DEPLOYMENT_TYPE} in
+	(normal) # {{{
+		cat <<EOF
+Site Definitions (${site})
+
+This directory contains templates that describe the infrastructure-specific
+settings and site-wide properties.  The templates are merged in the following order:
+
+  site/disk-pools.yml         If you need to, you can put disk pool
+                              definitions in this file.
+
+  site/update.yml             Specify job update parameters here, which can
+                              change based on the cloud provider in use,
+                              and its performance characteristics.
+
+  site/jobs.yml               Here you can modify the list of jobs defined
+                              at the global level, remove jobs (by setting
+                              their instances: count to 0), and supply any
+                              additional, site-wide job properties.
+
+  site/networks.yml           Define what networks to use for all the
+                              environments in this site (although you may
+                              want to defer the actual numbering to the
+                              environment level.
+
+  site/resource-pools.yml     Set up the resource pools to use for job
+                              virtual machines, and apply their cloud
+                              properties (i.e. availability zones)
+
+  site/properties.yml         Define properties (both globally and per-job),
+                              that are specific to this environment.  These will
+                              most likely override global properties.
+
+
+NOTE: If you make changes to the templates in here, they will automatically
+propagate to any newly-created environments, but you will need to run a
+refresh for existing environments to receive those updates.
+EOF
+		;; # }}}
+	(microbosh) # {{{
+		cat<<EOF
+Site Definitions (${site})
+
+This directory contains templates that describe the infrastructure-specific
+settings and site-wide properties.  The templates are merged in the following order:
+
+  site/infra.yml              Define infrastructure-specific settings for
+                              this MicroBOSH deployment, including resources,
+                              cloud properties, etc.
+
+  site/scaling.yml            Define sizing properties for things like number
+                              of director threads, RAM/CPU/Disk sizing, etc.
+
+
+NOTE: If you make changes to the templates in here, they will automatically
+propagate to any newly-created environments, but you will need to run a
+refresh for existing environments to receive those updates.
+EOF
+		;; # }}}
+	(bosh-init) # {{{
+		cat <<EOF
+Site Definitions (${site})
+
+This directory contains templates that describe the infrastructure-specific
+settings and site-wide properties.  The templates are merged in the following order:
+
+  site/disk-pools.yml         If you need to, you can put disk pool
+                              definitions in this file.
+
+  site/jobs.yml               Here you can modify the list of jobs defined
+                              at the global level, remove jobs (by setting
+                              their instances: count to 0), and supply any
+                              additional, site-wide job properties.
+
+  site/networks.yml           Define what networks to use for all the
+                              environments in this site (although you may
+                              want to defer the actual numbering to the
+                              environment level.
+
+  site/resource-pools.yml     Set up the resource pools to use for job
+                              virtual machines, and apply their cloud
+                              properties (i.e. availability zones)
+
+  site/properties.yml         Define properties (both globally and per-job),
+                              that are specific to this environment.  These will
+                              most likely override global properties.
+
+
+NOTE: If you make changes to the templates in here, they will automatically
+propagate to any newly-created environments, but you will need to run a
+refresh for existing environments to receive those updates.
+EOF
+# site/README
+		;; # }}}
+	esac
+}
+
+create_environment_readme() {
+	local site=${1:?create_environment_readme() - no site given}
+	local name=${2:?create_environment_readme() - no environment given}
+
+	case ${DEPLOYMENT_TYPE} in
+	(normal) # {{{
+		cat <<EOF
+Environment Definitions (${site}/${name})
+
+This directory contains templates that describe the environment-specific
+settings of a single deployment.  These templates will be combined with
+the global and site templates to produce a single BOSH manifest for deployment
+purposes.  The templates are merged in the following order:
+
+  monitoring.yml              Configure whatever (external) monitoring system you
+                              want to track the performance and health of your
+                              deployment.
+
+  networking.yml              Configure the network numbering for this deployment.
+
+  director.yml                Identify the BOSH director UUID for this deployment.
+
+  scaling.yml                 Define the scaling properties for this deployment,
+                              including things like the number of instances, sizes
+                              of persistent disks, resource pool limits, etc.
+
+  properties.yml              Define properties (both globally and per-job),
+                              that are specific to this environment.  These will
+                              most likely override global and site properties.
+
+  credentials.yml             Define passwords and credentials here, so that they
+                              are centralized.  Keep in mind that commiting these
+                              into version control incurs some security risk.
+
+  cloudfoundry.yml            For deployments that integrate with Cloud Foundry
+                              installations (i.e. as service brokers), you can
+                              specify the integration details here, including
+                              things like the CF API, credentials, domains, etc.
+
+  name.yml                    Specify the name of this deployment.
+
+
+This directory also contains a Makefile that makes it easier to build
+the final BOSH manifest from all of the constituent templates.
+Run \`make' to see some help, or \`make manifest' to just rebuild.
+EOF
+		;; # }}}
+	(microbosh) # {{{
+		cat <<EOF
+Environment Definitions (${site}/${name})
+
+This directory contains templates that describe the environment-specific
+settings of a single MicroBOSH deployment.  These templates will be combined
+with the global and site templates to produce a single manifest suitable for
+deployment via \`bosh micro'.  The templates are merged in the following order:
+
+  infra.yml                   Configure the Infrastructure that this MicroBOSH will
+                              be deployed on top of.
+
+  scaling.yml                 Define the scaling properties for this deployment,
+                              including things like disk sizing, RAM, etc.
+
+  director.yml                Identify the BOSH director UUID for this deployment.
+
+  name.yml                    Specify the name of this MicroBOSH deployment.
+
+
+This directory also contains a Makefile that makes it easier to build
+the final manifest from all of the constituent templates.
+Run \`make' to see some help, or \`make manifest' to just rebuild.
+EOF
+		;; # }}}
+	(bosh-init) # {{{
+		cat <<EOF
+Environment Definitions (${site}/${name})
+
+This directory contains templates that describe the environment-specific
+settings of a single bosh-init deployment.  These templates will be combined
+with the global and site templates to produce a single manifest suitable for
+deployment via \`bosh-init'.  The templates are merged in the following order:
+
+  networking.yml              Configure the network numbering for this BOSH.
+
+  properties.yml              Define properties (both globally and per-job),
+                              that are specific to this environment.  These will
+                              most likely override global and site properties.
+
+  credentials.yml             Define passwords and credentials here, so that they
+                              are centralized.  Keep in mind that commiting these
+                              into version control incurs some security risk.
+
+  name.yml                    Specify the name of this deployment.
+
+
+This directory also contains a Makefile that makes it easier to build
+the final manifest from all of the constituent templates.
+Run \`make' to see some help, or \`make manifest' to just rebuild.
+EOF
+		;; # }}}
+	esac
+}
+
+create_ci_pipeline() {
+	setup
+	mkdir -p ${DEPLOYMENT_ROOT}/ci
+	cat > ${DEPLOYMENT_ROOT}/ci/docker.yml <<EOF # {{{
+---
+# ci/docker.yml - Docker Image resource and tasks
+
+#######################################################################
+groups:
+  - (( append ))
+  - name: aux
+    jobs:
+    - build-task-image
+
+
+#######################################################################
+resources:
+
+  # The Docker image itself.  By default, this is going to be
+  # pushed to (public-facing) DockerHub, based on the credentials
+  # specified under \`meta' in ci/pipeline.yml
+  - name: task-image
+    type: docker-image
+    source:
+      email:      (( grab meta.docker.hub.email ))
+      username:   (( grab meta.docker.hub.username ))
+      password:   (( grab meta.docker.hub.password ))
+      repository: (( grab meta.docker.hub.repository ))
+
+  # Watch the git repository for changes to the Dockerfile
+  # (and anything else in ci/image, for local injection).
+  - name: dockerfile
+    type: git
+    source:
+      uri:         (( grab meta.git.repository ))
+      branch:      (( grab meta.git.branch ))
+      private_key: (( grab meta.git.private_key ))
+      paths:       [ ci/image/* ]
+
+  # Deployments need spruce to merge the manifest files together,
+  # so we need to add that into the final task image
+  # (this resource is only checked every 24 hours, because github
+  #  rate-limits their API, and we can manage being a bit behind)
+  - name: spruce
+    type: github-release
+    check_every: 24h
+    source:
+      user:         geofffranks
+      repository:   spruce
+
+
+#######################################################################
+jobs:
+
+  # Build (or rebuild) the Docker image, any time its definition
+  # changes, or we get a new version of spruce on Github.
+  - name: build-task-image
+    public: (( grab meta.public ))
+    serial: true
+
+    plan:
+        - { get: dockerfile, trigger: true }
+        - { get: spruce,     trigger: true }
+
+        - task: combine-inputs
+          config:
+            platform: linux
+            image: docker:///busybox
+            inputs:
+              - { name: dockerfile, path: . }
+              - { name: spruce,     path: ./ci/image/spruce }
+            run: { path: /bin/true }
+
+        - put: task-image
+          params:
+            build: combine-inputs/ci/image
+
+EOF
+# }}} ci/docker.yml
+	cat > ${DEPLOYMENT_ROOT}/ci/pipeline.yml <<EOF # {{{
+---
+meta:
+  public: true
+  deployment: ${DEPLOYMENT_NAME}
+  bosh:
+    target:   (( param "Please provide the URL to your BOSH Director" ))
+    username: (( param "Please provide account credentials for running BOSH deployments" ))
+    password: (( param "Please provide account credentials for running BOSH deployments" ))
+
+  git:
+    repository:  (( param "Please specify the full URL of this git repository" ))
+    private_key: (( param "Please specify the private key for accessing this git repository" ))
+    branch:      master
+
+  s3:
+    access_key: (( param "Please provide an Access Key for your S3 bucket" ))
+    secret_key: (( param "Please provide a Secret Key for your S3 bucket" ))
+    bucket:     (( concat meta.deployment "-pipeline-assets" ))
+    region:     us-east-1
+
+  docker:
+    image:
+      name: (( concat meta.deployment "-pipeline-builder" ))
+      url:  (( concat "docker://" meta.docker.registry "/" meta.docker.image.name ))
+    registry: ""
+    hub:
+      email:      (( param "Please specify the email address associated with your DockerHub account" ))
+      username:   (( param "Please specify the username of your DockerHub account" ))
+      password:   (( param "Please specify the password to your DockerHub account" ))
+      repository: (( grab meta.docker.image.name ))
+
+  global:
+    env:
+      VAULT_ADDR:       ~
+      CI_VAULT_USER_ID: concourse
+      CI_VAULT_APP_ID:  (( concat meta.deployment "-deployments-pipeline" ))
+
+resources:
+  - name: deployments-repo
+    type: git
+    source:
+      uri:         (( grab meta.git.repository ))
+      branch:      (( grab meta.git.branch ))
+      private_key: (( grab meta.git.private_key ))
+
+  - name: global-candidate
+    type: git
+    source:
+      .: (( inject resources.deployments-repo.source ))
+      paths: [global/*.yml]
+
+  - name: global-approved
+    type: s3
+    source:
+      private: true
+      bucket:            (( grab meta.s3.bucket ))
+      access_key_id:     (( grab meta.s3.access_key ))
+      secret_access_key: (( grab meta.s3.secret_key ))
+      regexp: global-(.*).tar.gz
+
+  - name: v.global
+    type: semver
+    source:
+      key:               global-version
+      initial_version:   0.1.0
+      bucket:            (( grab meta.s3.bucket ))
+      access_key_id:     (( grab meta.s3.access_key ))
+      secret_access_key: (( grab meta.s3.secret_key ))
+EOF
+# }}} ci/pipeline.yml
+
+	mkdir -p ${DEPLOYMENT_ROOT}/ci/image
+	cat > ${DEPLOYMENT_ROOT}/ci/image/Dockerfile <<EOF # {{{
+FROM concourse/concourse-ci
+
+# install curl
+RUN apt-get install -yy curl
+
+# install vault cli util
+ADD https://releases.hashicorp.com/vault/0.4.0/vault_0.4.0_linux_amd64.zip /tmp
+RUN cd /usr/bin && unzip /tmp/vault_0.4.0_linux_amd64.zip && ls && chmod 0755 /usr/bin/vault
+
+# install jq
+ADD http://stedolan.github.io/jq/download/linux64/jq /usr/bin/
+RUN chmod 755 /usr/bin/jq
+
+# install spruce
+ADD spruce/spruce_*_linux_amd64.tar.gz /tmp
+RUN mv /tmp/spruce_*_linux_amd64/spruce /usr/bin/spruce
+EOF
+# }}} ci/image/Dockerfile
+
+	mkdir -p ${DEPLOYMENT_ROOT}/ci/steps
+	touch ${DEPLOYMENT_ROOT}/.gitkeep
+}
+
+ensure_ci_pipeline() {
+	if [[ ! -d ${DEPLOYMENT_ROOT}/ci ]]; then
+		create_ci_pipeline
+	fi
+}
+
+create_normal_deployment() {
+	setup
+	echo "normal" > ${DEPLOYMENT_ROOT}/.deployment
+	mkdir -p ${DEPLOYMENT_ROOT}/global
+	mkdir -p ${DEPLOYMENT_ROOT}/global/releases
+
+	create_root_readme   >${DEPLOYMENT_ROOT}/README.md
+	create_global_readme >${DEPLOYMENT_ROOT}/global/README
+
+	cat > ${DEPLOYMENT_ROOT}/global/deployment.yml <<EOF
+---
+name: (( param "Please define the deployment name in the environment templates" ))
+
+update:
+  canaries: 1
+  max_in_flight: 1
+  serial: true
+EOF
+	for file in jobs properties; do
+		cat > ${DEPLOYMENT_ROOT}/global/${file}.yml <<EOF
+--- {}
+EOF
+	done
+}
+
+create_microbosh_deployment() {
+	setup
+	echo "microbosh" > ${DEPLOYMENT_ROOT}/.deployment
+	mkdir -p ${DEPLOYMENT_ROOT}/global
+
+	create_root_readme   >${DEPLOYMENT_ROOT}/README.md
+	create_global_readme >${DEPLOYMENT_ROOT}/global/README
+
+	cat > ${DEPLOYMENT_ROOT}/global/deployment.yml <<EOF
+---
+name: (( param "Please specify a name for your MicroBOSH deployment" ))
+network: (( param "Please define a network for your MicroBOSH deployment" ))
+resources:
+  persistent_disk:  (( param "Please define your persistent disk configuration" ))
+  cloud_properties: (( param "Please define your infrastructure's cloud properties" ))
+cloud:
+  plugin: (( param "site does not define cloud.plugin" ))
+  properties:
+    agent:
+      ntp:
+      - 0.pool.ntp.org
+      - 1.pool.ntp.org
+      - 2.pool.ntp.org
+      - 3.pool.ntp.org
+
+apply_spec:
+  agent:
+    blobstore:
+      address: (( param "Please define an address for your blobstore" ))
+    nats:
+      address: (( param "Please define an address for your nats message broker" ))
+  properties:
+    director:
+      max_threads: 5
+    ntp: (( grab cloud.properties.agent.ntp ))
+    registry:
+      address: (( param "Please define an address for the registry" ))
+    hm:
+      pagerduty_enabled: false
+      pagerduty:         ~
+
+      graphite_enabled:  false
+      graphite:          ~
+
+      datadog_enabled:   false
+      datadog:           ~
+
+      director_account:  (( param "Please provide the BOSH account name to use for health monitoring" ))
+      resurrector_enabled: true
+EOF
+}
+
+create_bosh_init_deployment() {
+	setup
+	echo "bosh-init" > ${DEPLOYMENT_ROOT}/.deployment
+	mkdir -p ${DEPLOYMENT_ROOT}/global
+	mkdir -p ${DEPLOYMENT_ROOT}/global/releases
+
+	create_root_readme   >${DEPLOYMENT_ROOT}/README.md
+	create_global_readme >${DEPLOYMENT_ROOT}/global/README
+
+	cat > ${DEPLOYMENT_ROOT}/global/deployment.yml <<EOF
+---
+name: (( param "Please specify a name for your BOSH deployment" ))
+
+releases: (( param "bosh-init deployments require a list of BOSH releases to deploy" ))
+
+resource_pools: (( param "Please define one or more resource pools for your BOSH deployment" ))
+disk_pools:     (( param "Please define one or more disk pools for your BOSH deployment" ))
+networks:       (( param "Please define one or more networks for your BOSH deployment" ))
+
+cloud_provider:
+  template: (( param "Please define the Cloud Provider to use for your BOSH deployment" ))
+  properties: (( param "Please define the configuration for your BOSH Cloud Provider" ))
+EOF
+	for file in jobs properties; do
+		cat > ${DEPLOYMENT_ROOT}/global/${file}.yml <<EOF
+--- {}
+EOF
+	done
+}
+
+refresh_global() {
+	setup
+	local site=${1:?refresh_global() - no site given}
+	local env=${2:?refresh_global() - no environment given}
+	local root="${DEPLOYMENT_ROOT}/${site}/${env}"
+
+	local saved=0
+	if [[ -d ${root}/.global ]]; then
+		saved=1
+		mv ${root}/.global ${root}/.global.old
+	fi
+
+	cp -a ${DEPLOYMENT_ROOT}/global ${root}/.global
+	if [[ $? != 0 ]]; then
+		if [[ ${saved} == 1 ]]; then
+			mv ${root}/.global.old ${root}/.global
+		fi
+		echo >&2 "Error: failed to refresh global for ${site}/${env}"
+		exit 2
+	fi
+
+	rm -fr ${root}/.global.old
+}
+
+create_normal_site() {
+	setup
+	local site=${1:?create_normal_site() - no site provided}
+
+	check_site_name ${site}
+
+	mkdir -p ${DEPLOYMENT_ROOT}/${site}
+	mkdir -p ${DEPLOYMENT_ROOT}/${site}/site
+	mkdir -p ${DEPLOYMENT_ROOT}/${site}/site/stemcell
+
+	create_site_readme ${site} >${DEPLOYMENT_ROOT}/${site}/site/README
+
+	cat > ${DEPLOYMENT_ROOT}/${site}/site/disk-pools.yml <<EOF
+---
+disk_pools: []
+EOF
+	cat > ${DEPLOYMENT_ROOT}/${site}/site/update.yml <<EOF
+---
+update:
+  canary_watch_time: 1000-60000
+  update_watch_time: 1000-60000
+  max_in_flight: 1
+EOF
+	for file in networks resource-pools jobs properties; do
+		cat > ${DEPLOYMENT_ROOT}/${site}/site/${file}.yml <<EOF
+--- {}
+EOF
+	done
+
+	(cd ${DEPLOYMENT_ROOT}/global/releases ; ls -1) > ${DEPLOYMENT_ROOT}/${site}/site/releases
+
+	echo "Created site ${site}:"
+	tree "${DEPLOYMENT_ROOT}/${site}"
+	echo
+	echo
+}
+
+create_microbosh_site() {
+	setup
+	local site=${1:?create_normal_site() - no site provided}
+
+	check_site_name ${site}
+
+	mkdir -p ${DEPLOYMENT_ROOT}/${site}
+	mkdir -p ${DEPLOYMENT_ROOT}/${site}/site
+
+	create_site_readme ${site} >${DEPLOYMENT_ROOT}/${site}/site/README
+
+	for file in infra scaling; do
+		cat > ${DEPLOYMENT_ROOT}/${site}/site/${file}.yml <<EOF
+--- {}
+EOF
+	done
+
+	echo "Created MicroBOSH site ${site}:"
+	tree "${DEPLOYMENT_ROOT}/${site}"
+	echo
+	echo
+}
+
+create_bosh_init_site() {
+	setup
+	local site=${1:?create_normal_site() - no site provided}
+
+	check_site_name ${site}
+
+	mkdir -p ${DEPLOYMENT_ROOT}/${site}
+	mkdir -p ${DEPLOYMENT_ROOT}/${site}/site
+
+	create_site_readme ${site} >${DEPLOYMENT_ROOT}/${site}/site/README
+
+	cat > ${DEPLOYMENT_ROOT}/${site}/site/disk-pools.yml <<EOF
+---
+disk_pools: []
+EOF
+	for file in networks resource-pools jobs properties; do
+		cat > ${DEPLOYMENT_ROOT}/${site}/site/${file}.yml <<EOF
+--- {}
+EOF
+	done
+
+	(cd ${DEPLOYMENT_ROOT}/global/releases ; ls -1) > ${DEPLOYMENT_ROOT}/${site}/site/releases
+
+	echo "Created BOSH (bosh-init) site ${site}:"
+	tree "${DEPLOYMENT_ROOT}/${site}"
+	echo
+	echo
+}
+
+refresh_site() {
+	setup
+	local site=${1:?refresh_site() - no site given}
+	local env=${2:?refresh_site() - no environment given}
+	local root="${DEPLOYMENT_ROOT}/${site}/${env}"
+
+	local saved=0
+	if [[ -d ${root}/.site ]]; then
+		saved=1
+		mv ${root}/.site ${root}/.site.old
+	fi
+
+	cp -a ${DEPLOYMENT_ROOT}/${site}/site ${root}/.site
+	if [[ $? != 0 ]]; then
+		if [[ ${saved} == 1 ]]; then
+			mv ${root}/.site.old ${root}/.site
+		fi
+		echo >&2 "Error: failed to refresh site for ${site}/${env}"
+		exit 2
+	fi
+
+	rm -fr ${root}/.site.old
+}
+
+create_normal_environment() {
+	setup
+	local site=${1:?create_normal_environment() - no site provided}
+	local name=${2:?create_normal_environment() - no environment name provided}
+	local root=$(env_root ${site} ${name})
+
+	check_site_name ${site}
+	check_environment_name ${name}
+
+	if [[ ! -d "${DEPLOYMENT_ROOT}/${site}" ]]; then
+		create_normal_site ${site}
+	fi
+
+	mkdir -p ${root}
+	create_makefile ${root}/Makefile
+	create_environment_readme ${site} ${name} >${root}/README
+
+	for file in cloudfoundry credentials director monitoring name properties networking scaling; do
+		cat > ${root}/${file}.yml <<EOF
+--- {}
+EOF
+	done
+
+	refresh_global ${site} ${name}
+	refresh_site   ${site} ${name}
+
+	echo "Created environment ${site}/${name}:"
+	tree ${root}
+	echo
+	echo
+}
+
+create_microbosh_environment() {
+	setup
+	local site=${1:?create_microbosh_environment() - no site provided}
+	local name=${2:?create_microbosh_environment() - no environment name provided}
+	local root=$(env_root ${site} ${name})
+
+	check_site_name ${site}
+	check_environment_name ${name}
+
+	if [[ ! -d "${DEPLOYMENT_ROOT}/${site}" ]]; then
+		create_microbosh_site ${site}
+	fi
+
+	mkdir -p ${root}
+	create_makefile ${root}/Makefile
+	create_environment_readme ${site} ${name} >${root}/README
+
+	for file in director infra name scaling; do
+		cat > ${root}/${file}.yml <<EOF
+--- {}
+EOF
+	done
+
+	refresh_global ${site} ${name}
+	refresh_site   ${site} ${name}
+
+	echo "Created environment ${site}/${env}:"
+	tree ${root}
+	echo
+	echo
+}
+
+create_bosh_init_environment() {
+	setup
+	local site=${1:?create_bosh_init_environment() - no site provided}
+	local name=${2:?create_bosh_init_environment() - no environment name provided}
+	local root=$(env_root ${site} ${name})
+
+	check_site_name ${site}
+	check_environment_name ${name}
+
+	if [[ ! -d "${DEPLOYMENT_ROOT}/${site}" ]]; then
+		create_bosh_init_site ${site}
+	fi
+
+	mkdir -p ${root}
+	create_makefile ${root}/Makefile
+	create_environment_readme ${site} ${name} >${root}/README
+
+	for file in credentials name properties networking; do
+		cat > ${root}/${file}.yml <<EOF
+--- {}
+EOF
+	done
+
+	refresh_global ${site} ${name}
+	refresh_site   ${site} ${name}
+
+	echo "Created environment ${site}/${env}:"
+	tree ${root}
+	echo
+	echo
+}
+
+releases_from() {
+	local file=${1:?releases_from() - file not provided}
+	cat ${file} | sed 's/\s*#.*//'
+}
+
+releases_for_site() {
+	setup
+	local site=${1:?releases_for_environment() - no site name provided}
+
+	releases_from "${DEPLOYMENT_ROOT}/${site}/site/releases"
+}
+
+releases_for_environment() {
+	setup
+	local site=${1:?releases_for_environment() - no site name provided}
+	local name=${2:?releases_for_environment() - no environment name provided}
+
+	releases_from "${DEPLOYMENT_ROOT}/${site}/${name}/.site/releases"
+}
+
+normal_site_metadata() {
+	must_be_in_an_environment
+	if [[ ! -f "${DEPLOYMENT_ENV_DIR}/.site/stemcell/name" ]]; then
+		echo >&2 "Error: no stemcell name specified for site"
+		exit 2
+	fi
+	local stemcell_name=$(cat "${DEPLOYMENT_ENV_DIR}/.site/stemcell/name")
+
+	if [[ ! -f "${DEPLOYMENT_ENV_DIR}/.site/stemcell/version" ]]; then
+		echo >&2 "Error: no stemcell version specified for site"
+		exit 2
+	fi
+	local stemcell_version=$(cat "${DEPLOYMENT_ENV_DIR}/.site/stemcell/version")
+
+	if [[ ! -f "${DEPLOYMENT_ENV_DIR}/.site/releases" ]]; then
+		echo >&2 "Error: no releases listed for site"
+		exit 2
+	fi
+
+	local releases=$(releases_from "${DEPLOYMENT_ENV_DIR}/.site/releases")
+	for rel in ${releases}; do
+		if [[ ! -d "${DEPLOYMENT_ENV_DIR}/.global/releases/${rel}" ]]; then
+			echo >&2 "Error: release '${rel}' not defined globally"
+			exit 2
+		fi
+		if [[ ! -f "${DEPLOYMENT_ENV_DIR}/.global/releases/${rel}/version" ]]; then
+			echo >&2 "Error: no version specified for '${rel}'"
+			exit 2
+		fi
+	done
+
+	cat <<EOF
+---
+meta:
+  stemcell:
+    name: ${stemcell_name}
+    version: "${stemcell_version}"
+releases:
+EOF
+	for rel in ${releases}; do
+		echo "  - name: ${rel}"
+		echo "    version: \"$(cat ${DEPLOYMENT_ENV_DIR}/.global/releases/${rel}/version)\""
+	done
+}
+
+build_normal_manifest() {
+	must_be_in_an_environment
+	need_command spruce
+
+	normal_site_metadata > ${DEPLOYMENT_ENV_DIR}/.begin.yml
+	(cd ${DEPLOYMENT_ENV_DIR}
+	 spruce $SPRUCE_OPTS merge --prune meta \
+	    .begin.yml \
+	    $(ensure_yaml_files \
+	        .begin.yml \
+	        \
+	        .global/jobs.yml \
+	        .global/deployment.yml \
+	        .global/properties.yml \
+	        \
+	        .site/disk-pools.yml \
+	        .site/update.yml \
+	        .site/jobs.yml \
+	        .site/networks.yml \
+	        .site/resource-pools.yml \
+	        .site/properties.yml \
+	        \
+	        monitoring.yml \
+	        networking.yml \
+	        director.yml \
+	        scaling.yml \
+	        properties.yml \
+	        credentials.yml \
+	        cloudfoundry.yml \
+	        name.yml))
+
+	rc=$?
+
+	rm -f ${DEPLOYMENT_ENV_DIR}/.begin.yml
+
+	if [[ $rc != 0 ]]; then
+		echo >&2 "Failed to merge templates; bailing..."
+		exit 5
+	fi
+}
+
+build_microbosh_manifest() {
+	must_be_in_an_environment
+	need_command spruce
+
+	(cd ${DEPLOYMENT_ENV_DIR}
+	 spruce $SPRUCE_OPTS merge --prune meta \
+	    $(ensure_yaml_files \
+	        .global/deployment.yml \
+	        \
+	        .site/infra.yml \
+	        .site/scaling.yml \
+	        \
+	        infra.yml \
+	        scaling.yml \
+	        director.yml \
+	        name.yml))
+
+	if [[ $? != 0 ]]; then
+		echo >&2 "Failed to merge templates; bailing..."
+		exit 5
+	fi
+}
+
+bosh_init_site_metadata() {
+	must_be_in_an_environment
+	if [[ ! -f "${DEPLOYMENT_ENV_DIR}/.site/stemcell/url" ]]; then
+		echo >&2 "Error: no stemcell URL listed for site"
+		exit 2
+	fi
+	local stemcell_url=$(cat "${DEPLOYMENT_ENV_DIR}/.site/stemcell/url")
+	if [[ ! -f "${DEPLOYMENT_ENV_DIR}/.site/stemcell/sha1" ]]; then
+		echo >&2 "Error: no stemcell sha1 listed for site"
+		exit 2
+	fi
+	local stemcell_sha1=$(cat "${DEPLOYMENT_ENV_DIR}/.site/stemcell/sha1")
+
+	if [[ ! -f "${DEPLOYMENT_ENV_DIR}/.site/releases" ]]; then
+		echo >&2 "Error: no releases listed for site"
+		exit 2
+	fi
+	local releases=$(releases_from "${DEPLOYMENT_ENV_DIR}/.site/releases")
+
+	for rel in ${releases}; do
+		if [[ ! -d "${DEPLOYMENT_ENV_DIR}/.global/releases/${rel}" ]]; then
+			echo >&2 "Error: release '${rel}' not defined globally"
+			exit 2
+		fi
+		if [[ ! -f "${DEPLOYMENT_ENV_DIR}/.global/releases/${rel}/url" ]]; then
+			echo >&2 "Error: no url specified for '${rel}'"
+			exit 2
+		fi
+		if [[ ! -f "${DEPLOYMENT_ENV_DIR}/.global/releases/${rel}/sha1" ]]; then
+			url=$(cat "${DEPLOYMENT_ENV_DIR}/.global/releases/${rel}/url")
+			echo >&2 "retrieving ${url}"
+			sha1=$(curl -LSs "${url}" | checksum | sed -e 's/ .*//')
+			if [[ -z "${sha1}" ]]; then
+				echo >&2 "Error: failed to download and verify ${rel} release"
+				echo >&2 "       (from $url)"
+				exit 2
+			fi
+			echo "$sha1" > "${DEPLOYMENT_ENV_DIR}/.global/releases/${rel}/sha1"
+		fi
+	done
+
+	cat <<EOF
+---
+meta:
+  stemcell:
+    url: ${stemcell_url}
+    sha1: ${stemcell_sha1}
+releases:
+EOF
+	for rel in ${releases}; do
+		echo "  - name: ${rel}"
+		echo "    url:  $(cat ${DEPLOYMENT_ENV_DIR}/.global/releases/${rel}/url)"
+		echo "    sha1: $(cat ${DEPLOYMENT_ENV_DIR}/.global/releases/${rel}/sha1)"
+	done
+}
+
+build_bosh_init_manifest() {
+	must_be_in_an_environment
+	need_command spruce
+
+	bosh_init_site_metadata > ${DEPLOYMENT_ENV_DIR}/.begin.yml
+	(cd ${DEPLOYMENT_ENV_DIR}
+	 spruce $SPRUCE_OPTS merge --prune meta \
+	    $(ensure_yaml_files \
+	        .begin.yml \
+	        \
+	        .global/jobs.yml \
+	        .global/deployment.yml \
+	        .global/properties.yml \
+	        \
+	        .site/disk-pools.yml \
+	        .site/jobs.yml \
+	        .site/networks.yml \
+	        .site/resource-pools.yml \
+	        .site/properties.yml \
+	        \
+	        networking.yml \
+	        properties.yml \
+	        credentials.yml \
+	        name.yml))
+	rc=$?
+
+	rm -f ${DEPLOYMENT_ENV_DIR}/.begin.yml
+
+	if [[ $rc != 0 ]]; then
+		echo >&2 "Failed to merge templates; bailing..."
+		exit 5
+	fi
+}
+
+
+####################################################
+# multi-call handlers
+
+cmd_help() {
+	local topic=""
+	while (( $# )); do
+		arg=$1 ; shift
+		case ${arg} in
+		(-*)
+			echo >&2 "USAGE: genesis help <topic>"
+			exit 1
+			;;
+		(*)
+			if [[ -n ${topic} ]]; then
+				topic="${topic} "
+			fi
+			topic="${topic}${arg}"
+		esac
+	done
+
+	case ${topic:-usage} in
+	(usage|help)
+		cat >&2 <<EOF
+USAGE: genesis <command> [arguments]
+
+Common commands:
+
+    genesis new deployment      Create a new deployment directory, with all the
+                                necessary files for deploying with Genesis.
+
+    genesis new site            Set up the files and directories for a new site.
+
+    genesis new environment     Set up the files and directories for a new environment.
+
+    genesis build               When run from inside of an environment directory,
+                                paste together all of the template files, in order
+                                and pop out a manifest file.
+
+    genesis diff                When run from inside of an environment directory,
+                                show a semantic diff of the generated manifest for that
+                                environment, against some other manifest file.
+
+    genesis refresh             Refresh the cached copies of site and/or global
+                                definitions inside the current environment directory.
+                                Can also be used to recreate the Makefile after a
+                                Genesis upgrade.
+
+    genesis bosh                Generates a deployable manifest (which may have secrets
+                                in it) and then runs the \`bosh\` CLI with remaining
+                                arguments.  Useful for recreating workers.
+
+    genesis help                Peruse the help!  Give it a topic argument, or the name
+                                of another command to get more detailed information.
+                                Documentation!
+
+EOF
+		exit 0
+		;;
+	(new)
+		cat >&2 <<EOF
+USAGE: genesis new deployment [options] NAME
+       genesis new site [options] SITE
+       genesis new environment SITE ENVIRONMENT
+
+Creates new things, with all the right files in all the right places.
+
+EOF
+		exit 0
+		;;
+	(new\ deployment)
+		cat >&2 <<EOF
+USAGE: genesis new deployment [options] NAME
+
+  Create a new deployment, complete with all the correct templates in
+  global/, and a base configuration.  This will create a sub-directory
+  in the current working directory, named <NAME>-deployments, and set
+  it up with git version control.
+
+  OPTIONS
+
+    -T, --type <type>
+
+        Generate a different type of deployment.  Valid values are
+        'bosh-init' and 'normal' (the default is 'normal').
+
+    -t, --template <name>
+
+        Base the deployment off of an upstream Genesis template, by
+        cloning a repository from github.com and using that.
+
+        Templates can be specified as qualified name containing the
+        Github org/user and repository name, i.e. "jhunt/bolo", or
+        as a simple name, i.e. "shield", which will be inferred to
+        belong to the starkandwayne organization.
+
+EOF
+		exit 0
+		;;
+	(new\ site)
+		cat >&2 <<EOF
+USAGE: genesis new site [options] NAME
+
+  Create a new site with the given name, and set up the necessary
+  directories and blank template files for defining the parts of a
+  BOSH manifest that map to infrastructural and site-wide things.
+
+  OPTIONS
+
+    -t, --template <name>
+
+        Base the new site off of a site template.
+
+        This generally only works if you generated the deployment
+        from an upstream Genesis template (via '--template')
+
+EOF
+		exit 0
+		;;
+	(new\ environment)
+		cat >&2 <<EOF
+USAGE: genesis new environment SITE NAME
+
+  Create a new environment with the given name, in the specified
+  site, and set up the directories and template files for local,
+  environment-specific things.
+
+EOF
+		exit 0
+		;;
+	(build)
+		cat >&2 <<EOF
+USAGE: genesis build
+
+Compiles all of the YAML templates down to a single BOSH manifest
+for the current environment.
+
+EOF
+		exit 0
+		;;
+	(refresh)
+		cat >&2 <<EOF
+USAGE: genesis refresh [(global|site|all|makefile|readme)]
+
+Copies current definitions of the global templates and/or the
+current site into the current environment.  By default, copies both.
+
+The argument 'makefile' only rebuilds the Makefile for an environment,
+which can be useful to bring old deployments in-line with newer versions
+of Genesis.
+
+Similarly, 'readme' only recreates the various README files for the top-level,
+the global/ directories, and all sites and environments.
+
+EOF
+		exit 0
+		;;
+	(makefile)
+		cat >&2 <<EOF
+When Genesis provisions a new environment, it creates a Makefile that
+provides some easy "shortcut" command invocation targets to simplify
+the manifest generation process.
+
+  $ make manifest           #  Build a new manifest for the environment
+                            #  by merging the template YAML files together.
+
+  $ make deploy             # Build the manifest and attempt to deploy it.
+                            # (This safely handles Vault'd credentials)
+
+  $ make refresh            #  Pull in fresh copies of global and site YAML
+                            #  templates (into .global/ and .site/).
+
+Since this is a real Makefile, you can combine the two actions:
+
+  $ make refresh manifest   #  Refresh global / site configuration and then
+                            #  build an up-to-date deployment manifest.
+
+EOF
+		exit 0
+		;;
+	(bosh)
+		cat >&2 <<EOF
+USAGE: genesis bosh [...]
+
+Generates a deployable manifest (which may contain credentials or other
+secrets) and then passes the remaining arguments off to the \`bosh\` CLI.
+
+For example, to rebuild the worker/1 job:
+
+    $ genesis bosh -t prod recreate worker 1
+
+All other BOSH commands are available, but may not necessarily benefit
+from the manifest re-generation step.
+
+EOF
+		exit 0
+		;;
+	(*)
+		cat >&2 <<EOF
+Unrecognized help topic '${topic}'.
+Try one of these:
+
+    genesis help usage
+    genesis help <command>
+
+EOF
+		exit 0
+		;;
+	esac
+	exit 1
+}
+
+cmd_new_deployment() {
+	local dtype="normal"
+	local root=$(pwd)
+	local name=""
+	local template=""
+
+	while (( $# )); do
+		arg=$1 ; shift
+		case ${arg} in
+		(-t|--type)
+			dtype=$1
+			shift
+			;;
+		(-T|--template)
+			template=$1
+			shift
+			;;
+		(-r|--root)
+			root=$1
+			shift
+			;;
+		(*)
+			name=${arg%-deployment*}
+			shift
+			;;
+		esac
+	done
+
+	if [[ -n ${template} ]]; then
+		if [[ ${template} != ?*/?* ]]; then
+			template="starkandwayne/${template}"
+		fi
+		template="${template%%-deployment*}-deployment"
+
+		if [[ -z ${name} ]]; then
+			name=${template##*/}
+			name=${name#-deployment*}
+		fi
+	fi
+	if [[ -z ${name:-} ]]; then
+		echo >&2 "USAGE: genesis new deployment [options] name"
+		exit 1
+	fi
+
+	if [[ ! -d ${root} ]]; then
+		echo >&2 "Error: root directory ${root} does not exist"
+		exit 1
+	fi
+
+	if [[ -d "${root}/${name}-deployments" ]]; then
+		echo >&2 "Error: target directory ${root}/${name}-deployments already exists!"
+		exit 1
+	fi
+
+	if [[ -n ${template} ]]; then
+		local url=https://github.com/${template}
+		set -e
+		echo "cloning from template ${url}"
+		git clone --origin upstream ${url} ${root}/${name}-deployments
+		cd ${root}/${name}-deployments
+		git config --remove-section branch.master
+		cmd_embed >/dev/null
+		git add bin/genesis
+		git commit -m "Initial clone of templated ${name} deployment"
+		exit 0
+	fi
+
+	case ${dtype} in
+	(bosh) dtype=bosh-init ;;
+	(normal|microbosh|bosh-init) ;;
+	(*)
+		echo >&2 "Error: unrecognized deployment type '${dtype}'"
+		exit 1
+		;;
+	esac
+
+	DEPLOYMENT_TYPE=${dtype}
+	DEPLOYMENT_NAME=${name}
+	DEPLOYMENT_ROOT="${root}/${name}-deployments"
+	mkdir ${DEPLOYMENT_ROOT}
+
+	case ${DEPLOYMENT_TYPE} in
+	(normal)
+		create_normal_deployment
+		;;
+	(microbosh)
+		create_microbosh_deployment
+		;;
+	(bosh-init)
+		create_bosh_init_deployment
+		;;
+	esac
+
+	#create_ci_pipeline
+	cmd_embed >/dev/null
+
+	cat > ${DEPLOYMENT_ROOT}/.gitignore <<EOF
+.begin.yml
+.deploy.yml
+EOF
+
+	if git symbolic-ref HEAD 2>&1 | grep -qE 'fatal: Not a git repository|fatal: Unable to read current working directory'; then
+		(cd ${DEPLOYMENT_ROOT}
+		 git init
+		 git add .
+		 git commit -m "Initial commit of ${name}-deployments")
+	fi
+	exit 0
+}
+
+cmd_new_site() {
+	local name=""
+	local template=""
+
+	while (( $# )); do
+		arg=$1 ; shift
+		case ${arg} in
+		(-T|--template)
+			template=$1
+			shift
+			;;
+		(*)
+			name=${arg}
+			;;
+		esac
+	done
+
+	if [[ -z ${name} ]]; then
+		echo >&2 "USAGE: genesis new site [options] name"
+		exit 1
+	fi
+
+	setup
+	if [[ -d "${DEPLOYMENT_ROOT}/${name}" ]]; then
+		echo "Site ${name} already exists"
+		exit 0
+	fi
+
+	if [[ -n ${template} ]]; then
+		if [[ ! -d ${DEPLOYMENT_ROOT}/.templates/${template} ]]; then
+			echo >&2 "Site template '${template}' not found..."
+			exit 2
+		fi
+
+		cp -a ${DEPLOYMENT_ROOT}/.templates/${template} ${DEPLOYMENT_ROOT}/${name}
+		create_site_readme ${name} >${DEPLOYMENT_ROOT}/${name}/README
+		exit 0
+	fi
+
+	case ${DEPLOYMENT_TYPE} in
+	(normal)
+		create_normal_site ${name}
+		;;
+	(microbosh)
+		create_microbosh_site ${name}
+		;;
+	(bosh-init)
+		create_bosh_init_site ${name}
+		;;
+	esac
+	exit 0
+}
+
+cmd_new_environment() {
+	local site=${1:?USAGE: genesis new environment SITE NAME}
+	local name=${2:?USAGE: genesis new environment SITE NAME}
+
+	setup
+	case ${DEPLOYMENT_TYPE} in
+	(normal)
+		create_normal_environment ${site} ${name}
+		;;
+	(microbosh)
+		create_microbosh_environment ${site} ${name}
+		;;
+	(bosh-init)
+		create_bosh_init_environment ${site} ${name}
+		;;
+	esac
+
+#	ensure_ci_pipeline
+#	cat > ${DEPLOYMENT_ROOT}/ci/steps/${site}-${name}.yml <<EOF # {{{
+#---
+## ${site}/${name} deployment pipeine steps
+########################################################################
+#groups:
+#  - name: ${site}
+#    jobs:
+#      - ${site}:${name}
+#
+#
+########################################################################
+#jobs:
+#  - name: ${site}:${name}
+#    public: (( grab meta.public ))
+#    serial: true
+#    serial-groups: [${site}:${name}]
+#
+#    plan:
+#      - aggregate:
+#        - get: repo
+#          resource: ${site}:${name} changes
+#          trigger: true
+#
+#      - task: manifest
+#        config:
+#          platform: linux
+#          image: (( grab meta.docker.image.url ))
+#          inputs:
+#            - { name: repo, path: . }
+#          params:
+#            .: (( inject meta.global.env ))
+#          run:
+#            path: ./bin/genesis
+#            args: [ci, manifest, (( grab meta.git.branch )), '${site}', '${name}']
+#
+#      - put: bosh
+#        resource: ${site}:${name} bosh
+#        params:
+#          manifest:  manifest/${site}/${name}/manifests/.deploy.yml
+#          releases:  []
+#          stemcells: []
+#
+#      - task: commit
+#        config:
+#          platform: linux
+#          image: (( grab meta.docker.image.url ))
+#          inputs:
+#            - { name: manifest, path: . }
+#          run:
+#            path: ./bin/genesis
+#            args: [ci, commit, "[${site}/${name}] :airplane: Automated Deployment"]
+#
+#      - put: git push ${site}:${name}
+#        params:
+#          repository: commit
+#          rebase:     true
+#
+#
+########################################################################
+#resources:
+#  - name: ${site}:${name} changes
+#    type: git
+#    source:
+#      .: (( inject resources.deployments-repo.source ))
+#      paths:
+#        - ${site}/${name}/*.yml
+#        - ${site}/${name}/.site/*.yml
+#        - ${site}/${name}/.global/*.yml
+#
+#  - name: git push ${site}:${name}
+#    type: git
+#    source:
+#      .: (( inject resources.deployments-repo.source ))
+#
+#  - name: ${site}:${name} bosh
+#    type: bosh-deployment
+#    source:
+#      target:     (( grab meta.bosh.target ))
+#      deployment: (( grab meta.bosh.deployment ))
+#      username:   (( grab meta.bosh.username ))
+#      password:   (( grab meta.bosh.password ))
+#      ignore_ssl: true
+#EOF
+## }}} ci/steps/*.yml
+	exit 0
+}
+
+bad_new() {
+	local arg=${1}
+	cat >&2 <<EOF
+USAGE: genesis new deployment
+       genesis new (site|environment)
+EOF
+	exit 1
+}
+
+cmd_add_release() {
+	local release=${1:?USAGE: genesis add relese NAME VERSION}
+	local version=${2:-latest}
+
+	setup
+	if [[ -d ${DEPLOYMENT_ROOT}/global/releases/${release} ]]; then
+		echo >&2 "Release ${release} already exists in global/releases/"
+		exit 1
+	fi
+	mkdir -p ${DEPLOYMENT_ROOT}/global/releases/${release}
+	echo ${version} > ${DEPLOYMENT_ROOT}/global/releases/${release}/version
+	if [[ ${version} == "latest" ]]; then
+		echo "Using the latest version of ${release}"
+	else
+		echo "Using v${version} of ${release}"
+	fi
+	exit 0
+}
+
+bad_add() {
+	local arg=${1}
+	cat >&2 <<EOF
+USAGE: genesis add release
+EOF
+	exit 1
+}
+
+cmd_set_release() {
+	local release=${1:?USAGE: genesis set relese NAME VERSION}
+	local version=${2:-latest}
+
+	setup
+	mkdir -p ${DEPLOYMENT_ROOT}/global/releases/${release}
+	echo ${version} > ${DEPLOYMENT_ROOT}/global/releases/${release}/version
+	if [[ ${version} == "latest" ]]; then
+		echo "Using the latest version of ${release}"
+	else
+		echo "Using v${version} of ${release}"
+	fi
+	exit 0
+}
+
+bad_set() {
+	local arg=${1}
+	cat >&2 <<EOF
+USAGE: genesis set release
+EOF
+	exit 1
+}
+
+cmd_use_release() {
+	release=${1:?USAGE: genesis use release NAME}
+
+	must_be_in_a_site
+	if [[ ! -d ${DEPLOYMENT_ROOT}/global/releases/${release} ]]; then
+		echo >&2 "Release ${release} is not defined globally."
+		echo >&2 "(Do you need to \`genesis add release ${release}' first?)"
+		exit 1
+	fi
+
+	relfile=${DEPLOYMENT_SITE_DIR}/site/releases
+	if grep -q "^${release}$" $relfile >/dev/null 2>&1; then
+		echo "Site ${DEPLOYMENT_SITE} is already set to use release ${release}"
+	else
+		echo "${release}" >> $relfile
+		echo "Site ${DEPLOYMENT_SITE} is now using release ${release}"
+	fi
+	exit 0
+}
+
+cmd_use_stemcell() {
+	name=${1:?USAGE: genesis use stemcell NAME VERSION}
+	version=${2:?USAGE: genesis use stemcell NAME VERSION}
+
+	must_be_in_a_site
+
+	# resolve aliases
+	case ${name} in
+	(aws)
+		name="bosh-aws-xen-hvm-ubuntu-trusty-go_agent"
+		;;
+	(azure|hyperv)
+		name="bosh-azure-hyperv-ubuntu-trusty-go_agent"
+		;;
+	(openstack)
+		name="bosh-openstack-kvm-ubuntu-trusty-go_agent"
+		;;
+	(vcloud)
+		name="bosh-vcloud-esxi-ubuntu-trusty-go_agent"
+		;;
+	(vsphere)
+		name="bosh-vsphere-esxi-ubuntu-trusty-go_agent"
+		;;
+	(warden|bosh-lite)
+		name="bosh-warden-boshlite-ubuntu-trusty-go_agent"
+		;;
+	esac
+
+	echo "${name}"    > ${DEPLOYMENT_SITE_DIR}/site/stemcell/name
+	echo "${version}" > ${DEPLOYMENT_SITE_DIR}/site/stemcell/version
+
+	echo "Site ${DEPLOYMENT_SITE} is now using stemcell ${name} v${version}"
+	exit 0
+}
+
+bad_use() {
+	local arg=${1}
+	cat >&2 <<EOF
+USAGE: genesis use release
+       genesis use stemcell
+EOF
+	exit 1
+}
+
+cmd_stemcells() {
+	setup
+
+	local site=${1:-$DEPLOYMENT_SITE}
+	local env=${2:-$DEPLOYMENT_ENVIRONMENT}
+
+	if [[ -n ${env} ]]; then
+		name=$(cat ${DEPLOYMENT_ROOT}/${site}/${env}/.site/stemcell/name)
+		vers=$(cat ${DEPLOYMENT_ROOT}/${site}/${env}/.site/stemcell/version)
+		printf "%s/%s\n" ${name} ${vers}
+		return
+	fi
+
+	if [[ -n ${site} ]]; then
+		name=$(cat ${DEPLOYMENT_ROOT}/${site}/site/stemcell/name)
+		vers=$(cat ${DEPLOYMENT_ROOT}/${site}/site/stemcell/version)
+		printf "%s/%s\n" ${name} ${vers}
+		return
+	fi
+
+	cat >&2 <<EOF
+USAGE: genesis stemcells <site> [<env>]
+
+(you can also \`cd\` into a site or environment directory
+ and just run \`genesis stemcells\` without any arguments)
+EOF
+	exit 1
+}
+
+cmd_releases() {
+	setup
+
+	local site=${1:-$DEPLOYMENT_SITE}
+	local env=${2:-$DEPLOYMENT_ENVIRONMENT}
+
+	if [[ -n ${env} ]]; then
+		for rel in $(releases_for_environment ${site} ${env}); do
+			vers=$(cat ${DEPLOYMENT_ROOT}/${site}/${env}/.global/releases/${rel}/version)
+			printf "%s/%s\n" ${rel} ${vers}
+		done
+		return
+	fi
+
+	if [[ -n ${site} ]]; then
+		for rel in $(releases_for_site ${site}); do
+			vers=$(cat ${DEPLOYMENT_ROOT}/global/releases/${rel}/version)
+			printf "%s/%s\n" ${rel} ${vers}
+		done
+		return
+	fi
+
+	cat >&2 <<EOF
+USAGE: genesis releases <site> [<env>]
+
+(you can also \`cd\` into a site or environment directory
+ and just run \`genesis releases\` without any arguments)
+EOF
+	exit 1
+}
+
+cmd_build() {
+	must_be_in_an_environment
+
+	target=${1:-manifest.yml}
+	mkdir -p ${DEPLOYMENT_ENV_DIR}/manifests
+
+	case ${DEPLOYMENT_TYPE} in
+	(normal)
+		build_normal_manifest > ${DEPLOYMENT_ENV_DIR}/manifests/${target}
+		;;
+	(microbosh)
+		build_microbosh_manifest > ${DEPLOYMENT_ENV_DIR}/manifests/${target}
+		;;
+	(bosh-init)
+		build_bosh_init_manifest > ${DEPLOYMENT_ENV_DIR}/manifests/${target}
+		;;
+	esac
+	exit 0
+}
+
+cmd_diff() {
+	must_be_in_an_environment
+	exit 0
+}
+
+cmd_refresh_global() {
+	must_be_in_an_environment
+	echo "Refreshing global definitions for ${DEPLOYMENT_SITE}/${DEPLOYMENT_ENVIRONMENT}"
+	refresh_global ${DEPLOYMENT_SITE} ${DEPLOYMENT_ENVIRONMENT}
+	exit 0
+}
+
+cmd_refresh_site() {
+	must_be_in_an_environment
+	echo "Refreshing site definitions for ${DEPLOYMENT_SITE}/${DEPLOYMENT_ENVIRONMENT}"
+	refresh_site ${DEPLOYMENT_SITE} ${DEPLOYMENT_ENVIRONMENT}
+	exit 0
+}
+
+cmd_refresh_all() {
+	must_be_in_an_environment
+	echo "Refreshing site definitions for ${DEPLOYMENT_SITE}/${DEPLOYMENT_ENVIRONMENT}"
+	refresh_site   ${DEPLOYMENT_SITE} ${DEPLOYMENT_ENVIRONMENT}
+	echo "Refreshing global definitions for ${DEPLOYMENT_SITE}/${DEPLOYMENT_ENVIRONMENT}"
+	refresh_global ${DEPLOYMENT_SITE} ${DEPLOYMENT_ENVIRONMENT}
+	exit 0
+}
+
+cmd_refresh_makefile() {
+	must_be_in_an_environment
+	echo "Refreshing Makefile for ${DEPLOYMENT_SITE}/${DEPLOYMENT_ENVIRONMENT}"
+	create_makefile "${DEPLOYMENT_ENV_DIR}/Makefile"
+}
+
+cmd_refresh_readmes() {
+	setup
+	echo "Refreshing README for the whole repository"
+	rm -f ${DEPLOYMENT_ROOT}/README*
+	create_root_readme >${DEPLOYMENT_ROOT}/README.md
+
+	echo "Refreshing README for global definitions"
+	create_global_readme >${DEPLOYMENT_ROOT}/global/README
+	for site in $(all_sites); do
+		echo "  Refreshing README for site '${site}'"
+		create_site_readme ${site} >${DEPLOYMENT_ROOT}/${site}/README
+		for env in $(all_environments_for ${site}); do
+			echo "    Refreshing README for environment '${site}/${env}'"
+			create_environment_readme ${site} ${env} >${DEPLOYMENT_ROOT}/${site}/${env}/README
+		done
+	done
+}
+
+bad_refresh() {
+	local arg=${1}
+	cat >&2 <<EOF
+USAGE: genesis refresh (all|global|site|makefile|readme)
+
+Refreshes the global and/or site definitions inside of a single environment,
+by copying in the definitions from upstream.
+
+The argument 'makefile' only rebuilds the Makefile for an environment,
+which can be useful to bring old deployments in-line with newer versions
+of Genesis.
+
+Similarly, 'readme' only recreates the various README files for the top-level,
+the global/ directories, and all sites and environments.
+EOF
+	exit 1
+}
+
+cmd_deploy() {
+	must_be_in_an_environment
+	case ${DEPLOYMENT_TYPE} in
+	(normal)
+		(VAULT_ADDR= cmd_build manifest.yml) || exit 3
+		(            cmd_build .deploy.yml)  || exit 4
+		[[ -n $DEBUG_LEAVE_THE_CREDS_THERE ]] || \
+			trap "rm -f ${DEPLOYMENT_ENV_DIR}/manifests/.deploy.yml" QUIT TERM INT EXIT
+
+		bosh -d ${DEPLOYMENT_ENV_DIR}/manifests/.deploy.yml deploy
+		exit $?
+		;;
+
+	(bosh-init)
+		(VAULT_ADDR= cmd_build manifest.yml) || exit 3
+		(            cmd_build .deploy.yml)  || exit 4
+		[[ -n $DEBUG_LEAVE_THE_CREDS_THERE ]] || \
+			trap "rm -f ${DEPLOYMENT_ENV_DIR}/manifests/.deploy.yml" QUIT TERM INT EXIT
+
+		if [[ ! -f "${DEPLOYMENT_ENV_DIR}/manifests/.deploy-state.json" ]]; then
+			echo "No existing genesis-created bosh-init statefile detected. Please help genesis find it."
+			read -e -p "Path to existing bosh-init statefile (leave blank for new deployments): " statefile
+			while [[ -n "${statefile}" && ! -f "${statefile}" ]]; do
+				echo "Invalid path."
+				read -e -p "Path to existing bosh-init statefile (leave blank for new deployments): " statefile
+			done
+			if [[ -n "${statefile}" ]]; then
+				mv "${statefile}" ${DEPLOYMENT_ENV_DIR}/manifests/.deploy-state.json
+			fi
+		fi
+
+		bosh-init deploy ${DEPLOYMENT_ENV_DIR}/manifests/.deploy.yml
+		exit $?
+		;;
+
+	(microbosh)
+		echo >&2 "MicroBOSH deployments do not currently support the \`deploy' command"
+		exit 1
+		;;
+	esac
+}
+
+ci_remerge_pipeline() {
+	spruce $SPRUCE_OPTS merge --prune meta \
+	  pipeline.yml \
+	  steps/*.yml \
+	  docker.yml
+}
+
+cmd_repipe() {
+	echo "Implementation forthcoming..."
+	exit 1
+#	echo "Updating Concourse pipeline configurations"
+#	need_command spruce
+#	need_command fly
+#
+#	if [[ ! -d ${DEPLOYMENT_ROOT}/ci ]]; then
+#		echo >&2 "ci/ directory not found..."
+#		exit 2
+#	fi
+#
+#	setup
+#	if [[ ! -f ${DEPLOYMENT_ROOT}/ci/target ]]; then
+#		echo >&2 "No target specified in ci/target!"
+#		exit 2
+#	fi
+#	local target=$(cat ${DEPLOYMENT_ROOT}/ci/target)
+#
+#	local pipeline="${DEPLOYMENT_NAME}-deployments"
+#	if [[ -f ${DEPLOYMENT_ROOT}/ci/name ]]; then
+#		pipeline=$(cat ${DEPLOYMENT_NAME}/ci/name)
+#	fi
+#
+#	(cd ${DEPLOYMENT_ROOT}/ci
+#	 VAULT_ADDR= ci_remerge_pipeline > live.yml    || exit 1
+#	             ci_remerge_pipeline > .deploy.yml || exit 1
+#
+#	 fly --target ${target} \
+#	     set-pipeline \
+#	     --config .deploy.yml \
+#	     --pipeline ${pipeline}) || exit 1
+}
+
+cmd_embed() {
+	echo "Embedding genesis script into repository"
+	setup
+
+	mkdir -p ${DEPLOYMENT_ROOT}/bin
+	cp ${BASH_SOURCE[0]} ${DEPLOYMENT_ROOT}/bin/genesis
+
+	${DEPLOYMENT_ROOT}/bin/genesis version
+}
+
+cmd_ci_manifest() {
+	local site=${1:?cmd_ci_manifest() - no site name provided}
+	local name=${2:?cmd_ci_manifest() - no environment name provided}
+
+	setup
+	switch_to ${site} ${name}
+
+	if [[ $REFRESH_GLOBAL = "yes" ]]; then
+		refresh_global ${site} ${name}
+	fi
+	if [[ $REFRESH_SITE = "yes" ]]; then
+		refresh_site ${site} ${name}
+	fi
+
+	if [[ -n ${VAULT_ADDR} ]]; then
+		echo "Authenticating to Vault at ${VAULT_ADDR}"
+		if [[ -z $(command -v vault) ]]; then
+			echo >&2 "\`vault' command not found in your \$PATH"
+			echo >&2 "  ($PATH)"
+			echo >&2 "You may need to install Vault in your task image"
+			exit 1
+		fi
+		echo
+
+		touch      ~/.vault
+		chmod 0400 ~/.vault
+		creds='{"user_id":"'${CI_VAULT_USER_ID:-concourse}'","app_id":"'${CI_VAULT_APP_ID:-generic-app}'"}'
+		if ! curl -Ls ${VAULT_ADDR}/v1/auth/app-id/login --data "${creds}" > ~/.vault; then
+			echo >&2 "Failed to authenticate to the Vault app-id backend:"
+			cat >&2 ~/.vault
+			exit 2
+		fi
+
+		VAULT_TOKEN=$(cat ~/.vault | jq -r '.auth.client_token')
+		rm ~/.vault
+		if ! vault status; then
+			echo >&2 "Failed to authenticate to Vault at ${VAULT_ADDR}; bailing..."
+			exit 2
+		fi
+
+		echo
+		echo "Testing Vault authentication by retrieving secret/handshake"
+		if ! vault read secret/handshake; then
+			echo >&2 "Failed to retrieve secret/handshake; assuming authentication failed..."
+			exit 3
+		fi
+
+	else
+		echo >&2 "No VAULT_ADDR found in environment; skipping authentication step"
+	fi
+	(VAULT_ADDR= cmd_build live.yml)    || exit 3
+	(            cmd_build .deploy.yml) || exit 4
+	exit 0
+}
+
+cmd_ci_commit() {
+	local msg="${@:-Automated Depoyment via Concourse}"
+
+	if [[ -z $(git config --get user.name) ]]; then
+		[ -z ${GIT_USERNAME} ] && GIT_USERNAME="Concourse Bot"
+		[ -z ${GIT_EMAIL}    ] && GIT_EMAIL="concourse@$(hostname -f)"
+
+		git config --global user.name  ${GIT_USERNAME}
+		git config --global user.email ${GIT_EMAIL}
+	fi
+
+	setup
+
+	# git add any live.yml files
+	find . -name live.yml | xargs -r git add
+
+	# get rid of any untracked files (pipeline assets, stemcells, etc.)
+	git clean -df
+
+	# commit what changes we've got and go
+	if [[ -n $(git status --porcelain) ]]; then
+		git status
+		echo
+
+		git add .
+		git commit -m "${msg}"
+		echo
+	else
+		echo "Nothing changed - not bothering to commit"
+	fi
+}
+
+cmd_bosh() {
+	must_be_in_an_environment
+
+	case ${DEPLOYMENT_TYPE} in
+	(normal)
+		(cmd_build .deploy.yml) || exit 3
+		[[ -n $DEBUG_LEAVE_THE_CREDS_THERE ]] || \
+			trap "rm -f ${DEPLOYMENT_ENV_DIR}/manifests/.deploy.yml" QUIT TERM INT EXIT
+
+		bosh -d ${DEPLOYMENT_ENV_DIR}/manifests/.deploy.yml $@
+		exit $?
+		;;
+
+	(microbosh)
+		echo >&2 "MicroBOSH deployments do not currently support the \`bosh' command"
+		exit 1
+		;;
+
+	(bosh-init)
+		echo >&2 "BOSH-init deployments do not currently support the \`bosh' command"
+		exit 1
+		;;
+	esac
+}
+
+cmd_dump() {
+	setup
+	printf "name: %s\n" ${DEPLOYMENT_NAME}
+	printf "type: %s\n" ${DEPLOYMENT_TYPE}
+	printf "root: %s\n" ${DEPLOYMENT_ROOT}
+	printf "site: %s\n" ${DEPLOYMENT_SITE}
+	printf "env:  %s\n" ${DEPLOYMENT_ENVIRONMENT}
+	exit 0
+}
+
+bad_command() {
+	local cmd=${1}
+	cat >&2 <<EOF
+Unrecognized sub-command: '$cmd'
+
+Try one of these:
+
+   genesis help
+   genesis new (deployment|site|environment)
+   genesis build
+   genesis refresh (global|site|all|makefile|readme)
+   genesis bosh ...
+
+EOF
+	exit 1
+}
+
+checksum() {
+  if [[ -z $(command -v sha1sum) ]]; then
+    shasum "$@"
+  else
+    sha1sum "$@"
+  fi
+}
+
+####################################################
+# multi-call interface
+
+main() {
+	local cmd=${1:-help} ; shift
+
+	case ${cmd} in
+	(ping)
+		exit 0
+		;;
+	(version|-v|--version)
+		s=$(cat ${BASH_SOURCE[0]} | checksum)
+		echo "genesis v${VERSION} (${s:0:12})"
+		exit 0
+		;;
+	(help|-h|--help|-?)
+		cmd_help $*
+		;;
+	(new)
+		local arg=${1:-} ; shift
+		case ${arg} in
+		(deployment)
+			cmd_new_deployment $*
+			;;
+		(site)
+			cmd_new_site $*
+			;;
+		(env|environment)
+			cmd_new_environment $*
+			;;
+		(*)
+			bad_new ${arg}
+			;;
+		esac
+		;;
+	(add)
+		local arg=${1:-} ; shift
+		case ${arg} in
+		(release)
+			cmd_add_release $*
+			;;
+		(*)
+			bad_add ${arg}
+			;;
+		esac
+		;;
+	(set)
+		local arg=${1:-} ; shift
+		case ${arg} in
+		(release)
+			cmd_set_release $*
+			;;
+		(*)
+			bad_set ${arg}
+			;;
+		esac
+		;;
+	(use)
+		local arg=${1:-} ; shift
+		case ${arg} in
+		(release)
+			cmd_use_release $*
+			;;
+		(stemcell)
+			cmd_use_stemcell $*
+			;;
+		(*)
+			bad_use ${arg}
+			;;
+		esac
+		;;
+	(stemcell|stemcells)
+		cmd_stemcells $*
+		;;
+	(release|releases)
+		cmd_releases $*
+		;;
+	(build)
+		cmd_build $*
+		;;
+	(diff)
+		cmd_diff $*
+		;;
+	(refresh)
+		local arg=${1:-all} ; shift
+		case ${arg} in
+		(global)
+			cmd_refresh_global $*
+			;;
+		(site)
+			cmd_refresh_site $*
+			;;
+		(all)
+			cmd_refresh_all $*
+			;;
+		(makefile|makefiles)
+			cmd_refresh_makefile $*
+			;;
+		(readme|readmes)
+			cmd_refresh_readmes $*
+			;;
+		(*)
+			bad_refresh ${arg}
+			;;
+		esac
+		;;
+	(deploy)
+		cmd_deploy
+		;;
+	(repipe)
+		# FIXME
+		echo "Implementation forthcoming..."
+		exit 1
+		;;
+	(embed)
+		cmd_embed
+		;;
+	(ci)
+		# FIXME
+		echo "Implementation forthcoming..."
+		exit 1
+
+		TERM=dumb
+		exec </dev/null
+
+		local arg=${1:-} ; shift
+		case ${arg} in
+		(manifest)
+			cmd_ci_manifest $*
+			;;
+		(commit)
+			cmd_ci_commit $*
+			;;
+		(*)
+			bad_ci ${arg}
+			;;
+		esac
+		;;
+	(dump)
+		cmd_dump
+		;;
+	(bosh)
+		cmd_bosh $*
+		;;
+	(*)
+		bad_command ${cmd}
+		;;
+	esac
+}
+
+# look for some help flags
+declare -a argv
+while (( $# != 0 )); do
+	case ${1} in
+	(-h|-\?|--help) argv=( help ${argv[@]}        ) ;;
+	(*)             argv=(      ${argv[@]} "${1}" ) ;;
+	esac
+	shift
+done
+set -- ${argv[@]}
+main $@
+
+# fin
