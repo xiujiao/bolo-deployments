@@ -1,0 +1,26 @@
+---
+resource_pools:
+- name:     small
+  network:  bolo
+  stemcell: (( grab meta.stemcell ))
+
+  cloud_properties:
+    cpu:  1
+    disk: 20480
+    ram:  8192
+
+
+compilation:
+  network: bolo
+  reuse_compilation_vms: true
+  workers: 4
+
+  cloud_properties:
+    cpu:  2
+    disk: 8192
+    ram:  2048
+
+
+jobs:
+- name: bolo
+  resource_pool: small

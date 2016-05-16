@@ -1,1 +1,19 @@
---- {}
+---
+jobs:
+  - name: bolo
+    templates:
+      - { release: bolo, name: bolo }
+      - { release: bolo, name: dbolo }
+      - { release: bolo, name: rrd }
+      - { release: bolo, name: gnossis }
+
+      - { release: toolbelt, name: toolbelt }
+      - { release: toolbelt, name: toolbelt-quick }
+
+    properties:
+      dbolo:
+        submission: 127.0.0.1
+      bolo:
+        rrd:
+          subscription: 127.0.0.1
+          submission:   127.0.0.1
