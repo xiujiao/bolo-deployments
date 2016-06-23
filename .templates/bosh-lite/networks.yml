@@ -1,0 +1,15 @@
+---
+networks:
+- name: bolo
+  type: manual
+  subnets:
+  - range: 10.244.48.0/24
+    gateway: 10.244.48.1
+    static:
+    - 10.244.48.2 - 10.244.48.60
+
+jobs:
+- name: bolo
+  networks:
+  - name: bolo
+    static_ips: (( static_ips 0, 1, 2 ))
