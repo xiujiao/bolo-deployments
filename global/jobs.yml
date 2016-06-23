@@ -1,4 +1,8 @@
 ---
+meta:
+  bolo:
+    address: (( param "Specify the IP of your bolo server (at the site level)" ))
+
 jobs:
   - name: bolo
     instances: 1
@@ -14,11 +18,15 @@ jobs:
 
     properties:
       dbolo:
-        submission:
-          address: 127.0.0.1
+        submission: (( grab meta.bolo ))
       bolo:
+        debug: true
+        subscription: (( grab meta.bolo ))
+        submission:   (( grab meta.bolo ))
         rrd:
-          subscription:
-            address: 127.0.0.1
-          submission:
-            address: 127.0.0.1
+          cached: true
+          subscription: (( grab meta.bolo ))
+          submission:   (( grab meta.bolo ))
+        gnossis:
+          cached: true
+
