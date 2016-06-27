@@ -1,0 +1,11 @@
+---
+networks:
+- name: bolo
+  type: manual
+  subnets: (( param "Specify your bolo subnet" ))
+
+jobs:
+- name: bolo
+  networks:
+  - name: bolo
+    static_ips: (( static_ips 0 ))
