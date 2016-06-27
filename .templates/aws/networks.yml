@@ -1,4 +1,8 @@
 ---
+meta:
+  bolo:
+    address: (( grab jobs.bolo.networks.bolo.static_ips.0 ))
+
 networks:
 - name: bolo
   type: manual
