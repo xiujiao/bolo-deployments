@@ -2,10 +2,12 @@
 meta:
   bolo:
     address: (( param "Specify the IP of your bolo server (at the site level)" ))
-
 jobs:
   - name: bolo
     instances: 1
+    networks:
+      - name: bolo
+        static_ips: (( static_ips 0 ))
     persistent_disk: 4096
     templates:
       - { release: bolo, name: bolo }
