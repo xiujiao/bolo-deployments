@@ -1,0 +1,5 @@
+---
+meta:
+  region: us-west-2
+  az: (( concat meta.region "a" ))
+

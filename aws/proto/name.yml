@@ -1,0 +1,4 @@
+---
+name: aws-proto-bolo
+meta:
+  vault_prefix: secret/aws/proto/bolo

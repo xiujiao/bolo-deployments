@@ -1,0 +1,15 @@
+---
+meta:
+  bolo:
+    address: (( grab jobs.bolo.networks.bolo.static_ips.0 ))
+
+networks:
+- name: bolo
+  type: manual
+  subnets: (( param "Specify your bolo subnet" ))
+
+jobs:
+- name: bolo
+  networks:
+  - name: bolo
+    static_ips: (( static_ips 0 ))

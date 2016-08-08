@@ -1,0 +1,34 @@
+---
+meta:
+  bolo:
+    address: (( param "Specify the IP of your bolo server (at the site level)" ))
+jobs:
+  - name: bolo
+    instances: 1
+    networks:
+      - name: bolo
+        static_ips: (( static_ips 0 ))
+    persistent_disk: 4096
+    templates:
+      - { release: bolo, name: bolo }
+      - { release: bolo, name: dbolo }
+      - { release: bolo, name: rrd }
+      - { release: bolo, name: gnossis }
+
+      - { release: toolbelt, name: toolbelt }
+      - { release: toolbelt, name: toolbelt-quick }
+
+    properties:
+      dbolo:
+        submission: (( grab meta.bolo ))
+      bolo:
+        debug: true
+        subscription: (( grab meta.bolo ))
+        submission:   (( grab meta.bolo ))
+        rrd:
+          cached: true
+          subscription: (( grab meta.bolo ))
+          submission:   (( grab meta.bolo ))
+        gnossis:
+          cached: true
+
